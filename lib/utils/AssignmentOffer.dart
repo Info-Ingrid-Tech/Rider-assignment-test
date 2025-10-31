@@ -5,28 +5,40 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
-
 import 'package:firebase_auth/firebase_auth.dart';
 
 import 'package:geolocator/geolocator.dart';
 
 class AssignmentOfferBanner extends StatefulWidget {
+  // NEW: assignment document id in rider_assignments
+  final String assignmentDocId;
+
+  // Existing: order document id in Orders
   final String orderId;
+
+  // Callbacks
   final VoidCallback onResolvedExternally;
-  final Future<void> Function() onAccept;
-  final Future<void> Function() onReject;
-  final Future<void> Function() onTimeout;
+  final Future Function() onAccept;
+  final Future Function() onReject;
+  final Future Function() onTimeout;
+
+  // Countdown seeds
   final int? initialSeconds;
+  final DateTime? expiresAt;
+
+  // Styling
   final Color? cardColor;
 
   const AssignmentOfferBanner({
     super.key,
+    required this.assignmentDocId,
     required this.orderId,
     required this.onAccept,
     required this.onReject,
     required this.onTimeout,
     required this.onResolvedExternally,
     this.initialSeconds,
+    this.expiresAt,
     this.cardColor,
   });
 
@@ -37,17 +49,32 @@ class AssignmentOfferBanner extends StatefulWidget {
 class _AssignmentOfferBannerState extends State<AssignmentOfferBanner> {
   final _db = FirebaseFirestore.instance;
   final _auth = FirebaseAuth.instance;
+
   Map<String, dynamic>? _order;
-  int _secondsLeft = 30;
+
+  // Countdown state
+  int _secondsLeft = 0;
+  DateTime? _expiresAt;
   Timer? _timer;
+
+  // Assignment watcher
   StreamSubscription<DocumentSnapshot<Map<String, dynamic>>>? _assignSub;
+
   bool _busy = false;
 
   @override
   void initState() {
     super.initState();
-    final seed = (widget.initialSeconds ?? 120);
-    _secondsLeft = seed > 0 ? seed.clamp(1, 600) : 120;
+
+    _expiresAt = widget.expiresAt;
+
+    if (_expiresAt != null) {
+      _secondsLeft = _remainingSeconds();
+    } else {
+      final seed = (widget.initialSeconds ?? 120);
+      _secondsLeft = seed > 0 ? seed.clamp(1, 600) : 120;
+    }
+
     _load();
     _startCountdown();
     _watchResolution();
@@ -61,10 +88,21 @@ class _AssignmentOfferBannerState extends State<AssignmentOfferBanner> {
   }
 
   Future<void> _load() async {
-    final snap = await _db.collection('Orders').doc(widget.orderId).get();
-    if (!mounted) return;
-    _order = snap.data();
-    if (mounted) setState(() {});
+    try {
+      final snap = await _db.collection('Orders').doc(widget.orderId).get();
+      if (!mounted) return;
+      _order = snap.data();
+      if (mounted) setState(() {});
+    } catch (e) {
+      // Ignore UI errors here
+    }
+  }
+
+  int _remainingSeconds() {
+    if (_expiresAt == null) return _secondsLeft;
+    final now = DateTime.now();
+    final secs = _expiresAt!.difference(now).inSeconds;
+    return secs.clamp(0, 600);
   }
 
   void _startCountdown() {
@@ -73,43 +111,53 @@ class _AssignmentOfferBannerState extends State<AssignmentOfferBanner> {
         t.cancel();
         return;
       }
-      if (_secondsLeft <= 1) {
+
+      final next = _expiresAt != null ? _remainingSeconds() : (_secondsLeft - 1);
+
+      if (next <= 0) {
         t.cancel();
-        // --- FIX ---
-        // Instead of calling onTimeout, we call onReject.
-        // This ensures the offer is explicitly rejected and the UI updates,
-        // resolving the "stuck" state.
-        await _safeRun(widget.onReject);
+        await _safeRun(widget.onTimeout);
       } else {
-        setState(() => _secondsLeft--);
+        setState(() => _secondsLeft = next);
       }
     });
   }
 
   void _watchResolution() {
+    // IMPORTANT: watch by assignmentDocId (not orderId) because rider_assignments doc ids are random
     _assignSub = _db
         .collection('rider_assignments')
-        .doc(widget.orderId)
+        .doc(widget.assignmentDocId)
         .snapshots()
         .listen((snap) {
       if (!snap.exists || !mounted) return;
       final status = snap.data()?['status'] as String?;
+      // Close the banner when offer is resolved elsewhere
       if (status == 'accepted' || status == 'rejected' || status == 'timeout') {
         widget.onResolvedExternally();
+      }
+
+      // Optional: if backend extends the offer, update expiresAt live
+      final expiresTs = snap.data()?['expiresAt'];
+      if (expiresTs is Timestamp) {
+        final newExpiry = expiresTs.toDate();
+        if (_expiresAt == null || newExpiry.isAfter(_expiresAt!)) {
+          setState(() {
+            _expiresAt = newExpiry;
+            _secondsLeft = _remainingSeconds();
+          });
+        }
       }
     });
   }
 
-  Future<void> _safeRun(Future<void> Function() fn) async {
-    if (_busy) return;
-    if (!mounted) return;
+  Future<void> _safeRun(Future Function() fn) async {
+    if (_busy || !mounted) return;
     setState(() => _busy = true);
     try {
       await fn();
     } finally {
-      if (mounted) {
-        setState(() => _busy = false);
-      }
+      if (mounted) setState(() => _busy = false);
     }
   }
 
@@ -118,9 +166,17 @@ class _AssignmentOfferBannerState extends State<AssignmentOfferBanner> {
     if (o == null) return null;
     final drop = o['deliveryAddress']?['geolocation'];
     if (drop == null) return null;
-    final pos = await Geolocator.getCurrentPosition();
-    return Geolocator.distanceBetween(
-        pos.latitude, pos.longitude, drop.latitude, drop.longitude);
+    try {
+      final pos = await Geolocator.getCurrentPosition();
+      return Geolocator.distanceBetween(
+        pos.latitude,
+        pos.longitude,
+        drop.latitude,
+        drop.longitude,
+      );
+    } catch (_) {
+      return null;
+    }
   }
 
   @override
@@ -162,8 +218,7 @@ class _AssignmentOfferBannerState extends State<AssignmentOfferBanner> {
                 const SizedBox(width: 8),
                 Text(
                   'Delivery Offer',
-                  style: theme.textTheme.titleMedium
-                      ?.copyWith(fontWeight: FontWeight.w700),
+                  style: theme.textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700),
                 ),
                 const Spacer(),
                 _CountdownPill(seconds: _secondsLeft),
@@ -171,6 +226,7 @@ class _AssignmentOfferBannerState extends State<AssignmentOfferBanner> {
             ),
             const SizedBox(height: 10),
 
+            // Body
             if (o == null)
               Row(
                 children: [
@@ -180,8 +236,7 @@ class _AssignmentOfferBannerState extends State<AssignmentOfferBanner> {
                     child: CircularProgressIndicator(strokeWidth: 2),
                   ),
                   const SizedBox(width: 10),
-                  Text('Loading order details...',
-                      style: theme.textTheme.bodyMedium),
+                  Text('Loading order details...', style: theme.textTheme.bodyMedium),
                 ],
               )
             else
@@ -190,8 +245,7 @@ class _AssignmentOfferBannerState extends State<AssignmentOfferBanner> {
                 children: [
                   Text(
                     'Order #${o['dailyOrderNumber'] ?? widget.orderId}',
-                    style: theme.textTheme.titleSmall
-                        ?.copyWith(fontWeight: FontWeight.w600),
+                    style: theme.textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w600),
                   ),
                   const SizedBox(height: 6),
                   Row(
@@ -201,8 +255,7 @@ class _AssignmentOfferBannerState extends State<AssignmentOfferBanner> {
                       const SizedBox(width: 6),
                       Expanded(
                         child: Text(
-                          o['deliveryAddress']?['fullAddress'] ??
-                              'Delivery address in details',
+                          o['deliveryAddress']?['fullAddress'] ?? 'Delivery address in details',
                           style: theme.textTheme.bodyMedium,
                         ),
                       ),
@@ -210,12 +263,9 @@ class _AssignmentOfferBannerState extends State<AssignmentOfferBanner> {
                   ),
                   const SizedBox(height: 6),
                   Builder(builder: (context) {
-                    final addr =
-                        (o['deliveryAddress'] as Map<String, dynamic>?) ??
-                            const {};
+                    final addr = (o['deliveryAddress'] as Map?) ?? const {};
                     final street = (addr['street'] as String?)?.trim() ?? '';
-                    final streetToShow =
-                    street.isNotEmpty ? street : 'Street not specified';
+                    final streetToShow = street.isNotEmpty ? street : 'Street not specified';
                     return Row(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
@@ -224,8 +274,7 @@ class _AssignmentOfferBannerState extends State<AssignmentOfferBanner> {
                         Expanded(
                           child: Text(
                             streetToShow,
-                            style: theme.textTheme.bodyMedium
-                                ?.copyWith(fontWeight: FontWeight.w600),
+                            style: theme.textTheme.bodyMedium?.copyWith(fontWeight: FontWeight.w600),
                           ),
                         ),
                       ],
@@ -252,6 +301,7 @@ class _AssignmentOfferBannerState extends State<AssignmentOfferBanner> {
 
             const SizedBox(height: 12),
 
+            // Actions
             Row(
               children: [
                 Expanded(
@@ -262,8 +312,7 @@ class _AssignmentOfferBannerState extends State<AssignmentOfferBanner> {
                     style: OutlinedButton.styleFrom(
                       foregroundColor: Colors.red,
                       side: const BorderSide(color: Colors.red),
-                      shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(12)),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
                     ),
                   ),
                 ),
@@ -276,8 +325,7 @@ class _AssignmentOfferBannerState extends State<AssignmentOfferBanner> {
                     style: ElevatedButton.styleFrom(
                       backgroundColor: Colors.green,
                       foregroundColor: Colors.white,
-                      shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(12)),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
                       elevation: 0,
                     ),
                   ),
@@ -300,6 +348,7 @@ class _CountdownPill extends StatelessWidget {
     final color = seconds <= 10
         ? Colors.red
         : (seconds <= 20 ? Colors.orange : Colors.blue);
+
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
       decoration: BoxDecoration(
@@ -311,8 +360,10 @@ class _CountdownPill extends StatelessWidget {
         children: [
           Icon(Icons.timer, size: 16, color: color),
           const SizedBox(width: 6),
-          Text('$seconds s',
-              style: TextStyle(fontWeight: FontWeight.w700, color: color)),
+          Text(
+            '$seconds s',
+            style: TextStyle(fontWeight: FontWeight.w700, color: color),
+          ),
         ],
       ),
     );

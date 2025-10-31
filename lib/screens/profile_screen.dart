@@ -4,7 +4,6 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:myapp/screens/edit_profile_screen.dart';
 import 'package:cached_network_image/cached_network_image.dart';
-
 import '../theme/app_theme.dart';
 import '../theme/theme_provider.dart';
 import 'delivery_history_screen.dart';
@@ -42,8 +41,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
   Widget build(BuildContext context) {
     final themeProvider = Provider.of<ThemeProvider>(context);
     final theme = Theme.of(context);
-    const accentColor = Colors.red; // Or AppTheme.accentColor if you have one
-
+    const accentColor = Colors.blue; // Or AppTheme.accentColor if you have one
     return Scaffold(
       backgroundColor: theme.scaffoldBackgroundColor,
       body: FutureBuilder<DocumentSnapshot?>(

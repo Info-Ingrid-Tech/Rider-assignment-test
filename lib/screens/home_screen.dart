@@ -3,32 +3,34 @@ import 'package:flutter/material.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:geolocator/geolocator.dart';
-import 'package:myapp/theme/app_theme.dart';
-import 'package:myapp/widgets/delivery_card.dart';
-import 'package:myapp/widgets/order_details_modal.dart';
+import 'package:geolocator_android/geolocator_android.dart';
+import 'package:geolocator_apple/geolocator_apple.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:audioplayers/audioplayers.dart';
 import 'package:flutter/foundation.dart' show defaultTargetPlatform, TargetPlatform;
-import 'package:geolocator_android/geolocator_android.dart';
-import 'package:geolocator_apple/geolocator_apple.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
-
+import 'package:myapp/theme/app_theme.dart';
+import 'package:myapp/widgets/delivery_card.dart';
+import 'package:myapp/widgets/order_details_modal.dart';
 import '../utils/AssignmentOffer.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
-
   @override
-  State<HomeScreen> createState() => _HomeScreenState();
+  State createState() => _HomeScreenState();
 }
 
 class _HomeScreenState extends State<HomeScreen> {
   // --- Firebase & Rider Info ---
   final FirebaseAuth _auth = FirebaseAuth.instance;
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
+
   String? _riderEmail;
   DocumentReference<Map<String, dynamic>>? _riderDocRef;
-  StreamSubscription<QuerySnapshot<Map<String, dynamic>>>? _assignSub;
+
+  StreamSubscription<QuerySnapshot<Map<String, dynamic>>>? _assignedOrdersSub;
+  StreamSubscription<QuerySnapshot<Map<String, dynamic>>>? _pendingAssignSub;
+  StreamSubscription<QuerySnapshot<Map<String, dynamic>>>? _acceptedAssignSub;
 
   // --- Location Monitoring State ---
   StreamSubscription<Position>? _locSub;
@@ -38,34 +40,53 @@ class _HomeScreenState extends State<HomeScreen> {
   // --- Notification & Sound State ---
   final FlutterLocalNotificationsPlugin _notifier = FlutterLocalNotificationsPlugin();
   final AudioPlayer _player = AudioPlayer();
-  bool _initialSnapshotDone = false;
+
+  bool _initialAssignedSnapshotDone = false;
   final Set<String> _selfAccepted = {};
 
   // --- Assignment Offer Overlay State ---
   OverlayEntry? _offerOverlay;
-  final List<String> _offerQueue = [];
+  // queue item = { 'assignmentId': '...', 'orderId': '...' }
+  final List<Map<String, String>> _offerQueue = <Map<String, String>>[];
   bool _offerShowing = false;
 
-  void _enqueueOffer(String orderId) {
-    _offerQueue.add(orderId);
-    if (!_offerShowing) _dequeueAndShow();
+  // --- Branch filtering helpers ---
+  final Set<String> _riderBranchIds = {};
+  String _normalizeBranch(String s) => s.trim().toLowerCase();
+  bool _orderMatchesBranches(List<dynamic>? orderBranches, Iterable<String> riderBranches) {
+    final orderSet = (orderBranches ?? const [])
+        .map((e) => _normalizeBranch(e.toString()))
+        .toSet();
+    final riderSet = riderBranches.map(_normalizeBranch).toSet();
+    return orderSet.intersection(riderSet).isNotEmpty;
+  }
+
+  // ------------- Offer queue helpers -------------
+  void _enqueueOffer(String assignmentId, String orderId) {
+    // Prevent duplicates of the same assignment id in queue
+    final exists = _offerQueue.any((e) => e['assignmentId'] == assignmentId);
+    if (!exists) {
+      _offerQueue.add({'assignmentId': assignmentId, 'orderId': orderId});
+      if (!_offerShowing) _dequeueAndShow();
+    }
   }
 
   void _dequeueAndShow() {
     if (_offerQueue.isEmpty || !mounted) return;
-    final orderId = _offerQueue.removeAt(0);
-    _showAssignmentOfferOverlay(orderId);
+    final item = _offerQueue.removeAt(0);
+    final assignmentId = item['assignmentId']!;
+    final orderId = item['orderId']!;
+    _showAssignmentOfferOverlay(assignmentId, orderId);
   }
 
   void _removeOfferOverlay() {
     _offerOverlay?.remove();
     _offerOverlay = null;
     _offerShowing = false;
-    // Show next if queued
     WidgetsBinding.instance.addPostFrameCallback((_) => _dequeueAndShow());
   }
 
-
+  // ------------- Lifecycle -------------
   @override
   void initState() {
     super.initState();
@@ -75,20 +96,23 @@ class _HomeScreenState extends State<HomeScreen> {
 
   @override
   void dispose() {
-    _assignSub?.cancel();
+    _assignedOrdersSub?.cancel();
+    _pendingAssignSub?.cancel();
+    _acceptedAssignSub?.cancel();
     _locSub?.cancel();
     _player.dispose();
+    _removeOfferOverlay();
     super.dispose();
   }
 
-  // --- Location Logic ---
+  // ------------- Location Logic -------------
   Future<bool> _ensureBgLocationPermission() async {
     final serviceEnabled = await Geolocator.isLocationServiceEnabled();
     if (!serviceEnabled) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-            content: Text(
-                'Location services are disabled. Please enable them.')));
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Location services are disabled. Please enable them.')),
+        );
       }
       return false;
     }
@@ -99,8 +123,8 @@ class _HomeScreenState extends State<HomeScreen> {
       if (permission == LocationPermission.denied) {
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
-              const SnackBar(
-                  content: Text('Location permission is required.')));
+            const SnackBar(content: Text('Location permission is required.')),
+          );
         }
         return false;
       }
@@ -108,26 +132,29 @@ class _HomeScreenState extends State<HomeScreen> {
 
     if (permission == LocationPermission.deniedForever) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-            content: Text('Go to settings to enable location permissions.')));
-        await Geolocator.openAppSettings();
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Go to settings to enable location permissions.')),
+        );
       }
+      await Geolocator.openAppSettings();
       return false;
     }
+
     return true;
   }
 
   LocationSettings _bgLocationSettings() {
-    final distanceFilter = 10; // Reduced for more frequent updates during testing
+    const distanceFilter = 10;
     if (defaultTargetPlatform == TargetPlatform.android) {
       return AndroidSettings(
         accuracy: LocationAccuracy.high,
         distanceFilter: distanceFilter,
-        intervalDuration: const Duration(seconds: 5), // More frequent interval
+        intervalDuration: const Duration(seconds: 5),
         foregroundNotificationConfig: const ForegroundNotificationConfig(
           notificationTitle: 'Delivery in Progress',
           notificationText: 'Sharing live location for your active order',
-          enableWakeLock: true, setOngoing: true,
+          enableWakeLock: true,
+          setOngoing: true,
         ),
       );
     } else if (defaultTargetPlatform == TargetPlatform.iOS) {
@@ -139,25 +166,24 @@ class _HomeScreenState extends State<HomeScreen> {
         showBackgroundLocationIndicator: true,
       );
     } else {
-      return LocationSettings(
+      return const LocationSettings(
         accuracy: LocationAccuracy.high,
         distanceFilter: distanceFilter,
       );
     }
   }
 
-  void _startArrivalMonitor(Map<String, dynamic> orderData, String orderId) async {
-    // If we are already monitoring this exact order, do nothing.
+  Future<void> _startArrivalMonitor(Map<String, dynamic> orderData, String orderId) async {
+    // If already monitoring this order, do nothing.
     if (_monitoringOrderId == orderId && _locSub != null) {
       debugPrint("Already monitoring order $orderId. Skipping.");
       return;
     }
 
     debugPrint("Starting arrival monitor for order $orderId...");
-    await _stopArrivalMonitor(); // Stop any previous monitor before starting a new one.
+    await _stopArrivalMonitor();
     _monitoringOrderId = orderId;
 
-    // Extract drop-off location.
     final GeoPoint? drop = orderData['deliveryAddress']?['geolocation'];
     if (drop == null) {
       debugPrint("! No drop-off location found for order $orderId.");
@@ -165,7 +191,6 @@ class _HomeScreenState extends State<HomeScreen> {
       return;
     }
 
-    // Ensure permissions and services are OK.
     final hasPermission = await _ensureBgLocationPermission();
     if (!mounted || !hasPermission) {
       debugPrint("! Permission denied or widget not mounted. Aborting monitor.");
@@ -173,35 +198,33 @@ class _HomeScreenState extends State<HomeScreen> {
       return;
     }
 
-    // Keep tracking even if arrival was already notified; only use this to prevent duplicate writes.
     bool arrivalNotified = orderData['arrivalNotified'] == true;
-
     final settings = _bgLocationSettings();
 
     _locSub = Geolocator.getPositionStream(locationSettings: settings).listen(
           (pos) async {
-        debugPrint("--> Location Update Received: ${pos.latitude}, ${pos.longitude}");
+        debugPrint("--> Location Update: ${pos.latitude}, ${pos.longitude}");
         if (!mounted || _riderDocRef == null) return;
 
-        // Update rider's live location.
+        // Update rider live location
         try {
-          await _riderDocRef!.update(
-            {'currentLocation': GeoPoint(pos.latitude, pos.longitude)},
-          );
+          await _riderDocRef!.update({'currentLocation': GeoPoint(pos.latitude, pos.longitude)});
         } catch (e) {
           debugPrint("! Failed to update rider location: $e");
         }
 
-        // Compute distance to destination.
+        // Distance to destination
         final dist = Geolocator.distanceBetween(
-          pos.latitude, pos.longitude, drop.latitude, drop.longitude,
+          pos.latitude,
+          pos.longitude,
+          drop.latitude,
+          drop.longitude,
         );
-        debugPrint(" Distance to destination: ${dist.toStringAsFixed(2)} meters.");
+        debugPrint(" Distance to destination: ${dist.toStringAsFixed(2)} m.");
 
-        // When within the radius, notify once but DO NOT stop monitoring.
         if (dist <= _ARRIVAL_RADIUS_METERS && !arrivalNotified) {
           arrivalNotified = true;
-          debugPrint("!!! Arrival threshold reached for order $orderId. Notifying (continuing tracking).");
+          debugPrint("!!! Arrival threshold reached for order $orderId. Notifying.");
           try {
             await _firestore.collection('Orders').doc(orderId).set({
               'arrivalNotified': true,
@@ -210,7 +233,6 @@ class _HomeScreenState extends State<HomeScreen> {
           } catch (e) {
             debugPrint("! Failed to set arrivalNotified: $e");
           }
-          // Intentionally keep streaming; stop only when delivered or when there is no active order.
         }
       },
       onError: (error) async {
@@ -218,28 +240,25 @@ class _HomeScreenState extends State<HomeScreen> {
         await _stopArrivalMonitor();
       },
       onDone: () {
-        debugPrint("Location stream was closed.");
+        debugPrint("Location stream closed.");
         _monitoringOrderId = null;
       },
     );
 
-    debugPrint("Location stream is now listening for order $orderId.");
+    debugPrint("Location stream listening for order $orderId.");
   }
 
   Future<void> _stopArrivalMonitor() async {
     if (_locSub != null) {
-      debugPrint(
-          "Stopping active location monitor for order $_monitoringOrderId.");
+      debugPrint("Stopping active location monitor for order $_monitoringOrderId.");
       await _locSub?.cancel();
       _locSub = null;
     }
     _monitoringOrderId = null;
   }
 
-  /* -------------------------------------------------------------------------
-   * Notification & Rider Info Load
-   * ---------------------------------------------------------------------- */
-  Future _initLocalNotifications() async {
+  // ------------- Notifications & Rider Info -------------
+  Future<void> _initLocalNotifications() async {
     const android = AndroidInitializationSettings('@mipmap/ic_launcher');
     const ios = DarwinInitializationSettings();
     await _notifier.initialize(
@@ -259,23 +278,16 @@ class _HomeScreenState extends State<HomeScreen> {
     });
   }
 
-
-
-  Future<void> _showAssignmentOfferOverlay(String orderId) async {
+  // ------------- Assignment Offer Overlay -------------
+  Future<void> _showAssignmentOfferOverlay(String assignmentDocId, String orderId) async {
     if (!mounted) return;
-
-    // Ensure we don't show duplicates
     if (_offerShowing) return;
     _offerShowing = true;
 
     try {
-      final docRef = FirebaseFirestore.instance
-          .collection('rider_assignments')
-          .doc(orderId);
+      final docRef = _firestore.collection('rider_assignments').doc(assignmentDocId);
       final snap = await docRef.get();
-
       if (!snap.exists) {
-        // Offer gone, skip.
         _offerShowing = false;
         WidgetsBinding.instance.addPostFrameCallback((_) => _dequeueAndShow());
         return;
@@ -284,26 +296,27 @@ class _HomeScreenState extends State<HomeScreen> {
       final data = snap.data() as Map<String, dynamic>? ?? {};
       final status = (data['status'] as String?) ?? 'pending';
       if (status != 'pending') {
-        // Already resolved externally, skip.
         _offerShowing = false;
         WidgetsBinding.instance.addPostFrameCallback((_) => _dequeueAndShow());
         return;
       }
 
-      // Compute initial countdown seconds:
+      // Compute initial countdown
       int initialSeconds = 120;
       final tsVal = data['timeoutSeconds'];
       if (tsVal is int && tsVal > 0) {
         initialSeconds = tsVal;
       }
-      final expiresAt = data['expiresAt'];
-      if (expiresAt is Timestamp) {
-        final remaining = expiresAt.toDate().difference(DateTime.now()).inSeconds;
+
+      DateTime? expiresAt;
+      final expiresTs = data['expiresAt'];
+      if (expiresTs is Timestamp) {
+        expiresAt = expiresTs.toDate();
+        final remaining = expiresAt.difference(DateTime.now()).inSeconds;
         if (remaining > 0) {
-          // Clamp to a reasonable window in case of clock skew
           initialSeconds = remaining.clamp(1, 600);
         } else {
-          // Already expired; mark timeout and skip UI
+          // already expired
           await docRef.set({
             'status': 'timeout',
             'respondedAt': FieldValue.serverTimestamp(),
@@ -325,24 +338,46 @@ class _HomeScreenState extends State<HomeScreen> {
                   left: 12,
                   right: 12,
                   child: AssignmentOfferBanner(
+                    assignmentDocId: assignmentDocId,
                     orderId: orderId,
-                    // Add this optional param to AssignmentOfferBanner to honor admin-configured timeouts.
                     initialSeconds: initialSeconds,
+                    expiresAt: expiresAt,
                     onAccept: () async {
-                      // Suppress post-accept assignment alert locally.
                       _selfAccepted.add(orderId);
                       try {
+                        // Branch guard on accept
+                        final orderSnap = await _firestore.collection('Orders').doc(orderId).get();
+                        final orderBranches = orderSnap.data()?['branchIds'] as List<dynamic>?;
+
+                        // Ensure local rider branches are available
+                        List<String> riderBranches = _riderBranchIds.toList();
+                        if (riderBranches.isEmpty && _riderDocRef != null) {
+                          final riderSnap = await _riderDocRef!.get();
+                          riderBranches = (riderSnap.data()?['branchIds'] as List?)
+                              ?.map((e) => e.toString())
+                              .toList() ??
+                              [];
+                        }
+
+                        if (!_orderMatchesBranches(orderBranches, riderBranches)) {
+                          if (mounted) {
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              const SnackBar(content: Text('This order is from another branch.')),
+                            );
+                          }
+                          await docRef.set({
+                            'status': 'rejected',
+                            'respondedAt': FieldValue.serverTimestamp(),
+                          }, SetOptions(merge: true));
+                          return;
+                        }
+
                         await docRef.set({
                           'status': 'accepted',
                           'respondedAt': FieldValue.serverTimestamp(),
                         }, SetOptions(merge: true));
 
-                        // ADD THIS: Immediately refresh the current delivery section
-                        if (mounted) {
-                          setState(() {
-                            // Force UI refresh
-                          });
-                        }
+                        if (mounted) setState(() {});
                       } finally {
                         _removeOfferOverlay();
                       }
@@ -367,7 +402,6 @@ class _HomeScreenState extends State<HomeScreen> {
                         _removeOfferOverlay();
                       }
                     },
-                    // Banner should invoke this when it detects status != 'pending' or doc deletion.
                     onResolvedExternally: _removeOfferOverlay,
                     cardColor: theme.cardColor,
                   ),
@@ -380,32 +414,26 @@ class _HomeScreenState extends State<HomeScreen> {
 
       Overlay.of(context).insert(_offerOverlay!);
     } catch (e) {
-      // Fail-safe: do not block the queue on error.
       debugPrint('Failed to show assignment offer overlay for $orderId: $e');
       _offerShowing = false;
       WidgetsBinding.instance.addPostFrameCallback((_) => _dequeueAndShow());
     }
   }
 
-
+  // ------------- Rider bootstrap -------------
   Future<void> _loadCurrentRiderInfo() async {
     final User? currentUser = _auth.currentUser;
     if (currentUser == null || currentUser.email == null) return;
-
     final email = currentUser.email!;
     setState(() {
       _riderEmail = email;
       _riderDocRef = _firestore.collection('Drivers').doc(email);
     });
 
-    // Save token outside setState
     await _saveFcmToken();
-
-    // Only start listeners after state is set
     _listenForAssignedOrders();
     _listenForAssignmentOffers();
   }
-
 
   Future<void> _saveFcmToken() async {
     try {
@@ -423,22 +451,22 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  // ------------- Streams -------------
   void _listenForAssignedOrders() {
     if (_riderEmail == null) return;
-    _assignSub = _firestore
+    _assignedOrdersSub = _firestore
         .collection('Orders')
         .where('riderId', isEqualTo: _riderEmail)
         .where('status', whereIn: ['assigned', 'rider_assigned', 'accepted'])
         .snapshots()
         .listen((snapshot) {
-      if (!_initialSnapshotDone) {
-        _initialSnapshotDone = true;
+      if (!_initialAssignedSnapshotDone) {
+        _initialAssignedSnapshotDone = true;
         return;
       }
       for (final change in snapshot.docChanges) {
         if (change.type == DocumentChangeType.added) {
           final orderId = change.doc.id;
-          // Suppress if this was accepted by the rider from either flow
           if (!_selfAccepted.remove(orderId)) {
             _alertAndSound(change.doc.data() as Map<String, dynamic>, orderId);
           }
@@ -447,10 +475,11 @@ class _HomeScreenState extends State<HomeScreen> {
     });
   }
 
-
   void _listenForAssignmentOffers() {
     if (_riderEmail == null) return;
-    FirebaseFirestore.instance
+
+    // Listen for pending assignment offers for this rider
+    _pendingAssignSub = _firestore
         .collection('rider_assignments')
         .where('riderId', isEqualTo: _riderEmail)
         .where('status', isEqualTo: 'pending')
@@ -458,14 +487,17 @@ class _HomeScreenState extends State<HomeScreen> {
         .listen((snap) {
       for (final change in snap.docChanges) {
         if (change.type == DocumentChangeType.added) {
-          final orderId = change.doc.id;
-          _enqueueOffer(orderId);
+          final assignmentId = change.doc.id;
+          final data = change.doc.data();
+          final orderId = (data?['orderId'] as String?) ?? '';
+          if (orderId.isEmpty) continue;
+          _filterAndEnqueueOffer(assignmentId, orderId);
         }
       }
     });
 
-    // ADD THIS: Listen for assignment completion to refresh the current delivery
-    FirebaseFirestore.instance
+    // Optional: react when an assignment is accepted anywhere (refresh UI)
+    _acceptedAssignSub = _firestore
         .collection('rider_assignments')
         .where('riderId', isEqualTo: _riderEmail)
         .where('status', isEqualTo: 'accepted')
@@ -473,78 +505,103 @@ class _HomeScreenState extends State<HomeScreen> {
         .listen((snap) {
       for (final change in snap.docChanges) {
         if (change.type == DocumentChangeType.added) {
-          final orderId = change.doc.id;
-          print('🎯 Assignment accepted for order $orderId - refreshing streams');
-
-          // Mark as self-accepted to suppress duplicate notifications
-          _selfAccepted.add(orderId);
-
-          // Force refresh the assigned orders stream by updating the query
-          setState(() {
-            // This will trigger a rebuild of the StreamBuilder
-          });
+          final data = change.doc.data();
+          final orderId = (data?['orderId'] as String?) ?? '';
+          if (orderId.isNotEmpty) {
+            _selfAccepted.add(orderId);
+            if (mounted) setState(() {});
+          }
         }
       }
     });
   }
 
+  Future<void> _filterAndEnqueueOffer(String assignmentId, String orderId) async {
+    try {
+      final orderSnap = await _firestore.collection('Orders').doc(orderId).get();
+      if (!orderSnap.exists) return;
 
-  Future _alertAndSound(Map<String, dynamic> orderData, String orderId) async {
+      // Ensure we have driver's branches
+      if (_riderBranchIds.isEmpty && _riderDocRef != null) {
+        final riderSnap = await _riderDocRef!.get();
+        final rb = (riderSnap.data()?['branchIds'] as List?)
+            ?.map((e) => e.toString())
+            .toList() ??
+            [];
+        _riderBranchIds
+          ..clear()
+          ..addAll(rb);
+      }
+
+      final orderBranches = orderSnap.data()?['branchIds'] as List<dynamic>?;
+      if (_orderMatchesBranches(orderBranches, _riderBranchIds)) {
+        _enqueueOffer(assignmentId, orderId);
+      } else {
+        // Optionally auto-reject; currently ignored.
+      }
+    } catch (_) {
+      // Not critical
+    }
+  }
+
+  // ------------- Alerts & Sounds -------------
+  Future<void> _alertAndSound(Map<String, dynamic> orderData, String orderId) async {
     final orderLabel = orderData['dailyOrderNumber']?.toString() ?? orderId;
+
     if (mounted) {
       showDialog(
         context: context,
-        builder: (_) =>
-            AlertDialog(
-              title: const Text('New Order Assigned'),
-              content: Text(
-                  'Order #$orderLabel has just been assigned to you.'),
-              actions: [
-                TextButton(
-                  child: const Text('View'),
-                  onPressed: () {
-                    Navigator.of(context).pop();
-                    _showOrderDetailsSheet(context, orderData, orderId);
-                  },
-                ),
-                TextButton(
-                  child: const Text('Dismiss'),
-                  onPressed: () => Navigator.of(context).pop(),
-                ),
-              ],
+        builder: (_) => AlertDialog(
+          title: const Text('New Order Assigned'),
+          content: Text('Order #$orderLabel has just been assigned to you.'),
+          actions: [
+            TextButton(
+              child: const Text('View'),
+              onPressed: () {
+                Navigator.of(context).pop();
+                _showOrderDetailsSheet(context, orderData, orderId);
+              },
             ),
+            TextButton(
+              child: const Text('Dismiss'),
+              onPressed: () => Navigator.of(context).pop(),
+            ),
+          ],
+        ),
       );
     }
+
     const androidDetails = AndroidNotificationDetails(
-      'new-orders-v2', 'New Orders',
-      importance: Importance.max, priority: Priority.high,
+      'new-orders-v2',
+      'New Orders',
+      importance: Importance.max,
+      priority: Priority.high,
       sound: RawResourceAndroidNotificationSound('new_order'),
     );
     const iosDetails = DarwinNotificationDetails(sound: 'new_order.aiff');
+
     await _notifier.show(
-      orderId.hashCode, 'New order assigned',
+      orderId.hashCode,
+      'New order assigned',
       'Order #$orderLabel has just been assigned to you.',
       const NotificationDetails(android: androidDetails, iOS: iosDetails),
       payload: orderId,
     );
+
     await _player.play(AssetSource('sounds/new_order.mp3'));
   }
 
-  /* -------------------------------------------------------------------------
-   * UI Helpers
-   * ---------------------------------------------------------------------- */
-  void _showOrderDetailsSheet(BuildContext context,
-      Map<String, dynamic> orderData, String orderId) {
+  // ------------- UI Helpers -------------
+  void _showOrderDetailsSheet(BuildContext context, Map<String, dynamic> orderData, String orderId) {
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
       backgroundColor: Colors.transparent,
-      builder: (context) =>
-          OrderDetailsSheet(orderData: orderData, orderId: orderId),
+      builder: (context) => OrderDetailsSheet(orderData: orderData, orderId: orderId),
     );
   }
 
-  Future _updateRiderStatus(bool isOnline) async {
+  Future<void> _updateRiderStatus(bool isOnline) async {
     if (_riderDocRef != null) {
       await _riderDocRef!.update({'status': isOnline ? 'online' : 'offline'});
     }
@@ -576,26 +633,24 @@ class _HomeScreenState extends State<HomeScreen> {
   }) async {
     final theme = Theme.of(context);
     return showDialog(
-      context: context, barrierDismissible: false,
+      context: context,
+      barrierDismissible: false,
       builder: (BuildContext dialogContext) {
         return AlertDialog(
           backgroundColor: theme.cardColor,
-          shape: RoundedRectangleBorder(
-              borderRadius: BorderRadius.circular(20.0)),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20.0)),
           title: Text(title, style: theme.textTheme.titleLarge),
           content: Text(content, style: theme.textTheme.bodyMedium),
           actions: [
             TextButton(
-              child: Text('Cancel',
-                  style: TextStyle(color: theme.colorScheme.secondary)),
+              child: Text('Cancel', style: TextStyle(color: theme.colorScheme.secondary)),
               onPressed: () => Navigator.of(dialogContext).pop(),
             ),
             ElevatedButton(
               style: ElevatedButton.styleFrom(
                 backgroundColor: AppTheme.dangerColor,
                 foregroundColor: Colors.white,
-                shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(12)),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
               ),
               onPressed: () {
                 Navigator.of(dialogContext).pop();
@@ -609,9 +664,7 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  /* -------------------------------------------------------------------------
-   * BUILD
-   * ---------------------------------------------------------------------- */
+  // ------------- Build -------------
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
@@ -637,9 +690,15 @@ class _HomeScreenState extends State<HomeScreen> {
 
           final riderData = riderSnapshot.data!.data()!;
           final bool isOnline = riderData['status'] == 'online';
-          final String riderName = riderData['name']
-              ?.split(' ')
-              .first ?? 'Rider';
+          final String riderName = riderData['name']?.toString().split(' ').first ?? 'Rider';
+
+          final List<String> riderBranches = (riderData['branchIds'] as List?)
+              ?.map((e) => e.toString())
+              .toList() ??
+              [];
+          _riderBranchIds
+            ..clear()
+            ..addAll(riderBranches);
 
           return Column(
             crossAxisAlignment: CrossAxisAlignment.start,
@@ -649,27 +708,22 @@ class _HomeScreenState extends State<HomeScreen> {
               const SizedBox(height: 24),
               const Padding(
                 padding: EdgeInsets.symmetric(horizontal: 16.0),
-                child: Text('My Current Delivery',
-                    style: TextStyle(
-                        fontWeight: FontWeight.bold, fontSize: 20)),
+                child: Text('My Current Delivery', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 20)),
               ),
               const SizedBox(height: 10),
               _buildAssignedOrderStream(),
               const SizedBox(height: 20),
               const Padding(
                 padding: EdgeInsets.symmetric(horizontal: 16.0),
-                child: Text('Available Orders',
-                    style: TextStyle(
-                        fontWeight: FontWeight.bold, fontSize: 20)),
+                child: Text('Available Orders', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 20)),
               ),
               const SizedBox(height: 10),
               if (isOnline)
-                Expanded(child: _buildAvailableOrdersStream())
+                Expanded(child: _buildAvailableOrdersStream(riderBranches))
               else
                 const Expanded(
                   child: Center(
-                    child: Text("You are offline.",
-                        style: TextStyle(color: Colors.grey, fontSize: 16)),
+                    child: Text("You are offline.", style: TextStyle(color: Colors.grey, fontSize: 16)),
                   ),
                 ),
             ],
@@ -679,9 +733,6 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  /* -------------------------------------------------------------------------
-   * Small widget builders
-   * ---------------------------------------------------------------------- */
   Widget _buildHeader(BuildContext context, String name, bool isOnline) {
     final theme = Theme.of(context);
     return Container(
@@ -689,14 +740,8 @@ class _HomeScreenState extends State<HomeScreen> {
       width: double.infinity,
       decoration: BoxDecoration(
         color: theme.cardColor,
-        boxShadow: [
-          BoxShadow(
-              color: Colors.black.withOpacity(0.1),
-              blurRadius: 10,
-              offset: const Offset(0, 4))
-        ],
-        borderRadius: const BorderRadius.only(
-            bottomLeft: Radius.circular(24), bottomRight: Radius.circular(24)),
+        boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.1), blurRadius: 10, offset: const Offset(0, 4))],
+        borderRadius: const BorderRadius.only(bottomLeft: Radius.circular(24), bottomRight: Radius.circular(24)),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -705,15 +750,14 @@ class _HomeScreenState extends State<HomeScreen> {
           const SizedBox(height: 4),
           Row(
             children: [
-              Text("You are currently ",
-                  style: TextStyle(
-                      color: theme.colorScheme.secondary, fontSize: 16)),
+              Text("You are currently ", style: TextStyle(color: theme.colorScheme.secondary, fontSize: 16)),
               Text(
                 isOnline ? "Online" : "Offline",
                 style: TextStyle(
-                    color: isOnline ? Colors.green : Colors.red,
-                    fontWeight: FontWeight.bold,
-                    fontSize: 16),
+                  color: isOnline ? Colors.green : Colors.red,
+                  fontWeight: FontWeight.bold,
+                  fontSize: 16,
+                ),
               ),
             ],
           ),
@@ -728,19 +772,14 @@ class _HomeScreenState extends State<HomeScreen> {
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
         decoration: BoxDecoration(
-          color: Theme
-              .of(context)
-              .cardColor,
+          color: Theme.of(context).cardColor,
           borderRadius: BorderRadius.circular(12),
           border: Border.all(color: Colors.grey.withOpacity(0.2), width: 1),
         ),
         child: Row(
           mainAxisAlignment: MainAxisAlignment.spaceBetween,
           children: [
-            Text("My Status", style: Theme
-                .of(context)
-                .textTheme
-                .titleMedium),
+            Text("My Status", style: Theme.of(context).textTheme.titleMedium),
             Switch(
               value: isOnline,
               onChanged: _updateRiderStatus,
@@ -753,9 +792,7 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  /* -------------------------------------------------------------------------
-   * Streams
-   * ---------------------------------------------------------------------- */
+  // --- Streams for orders ---
   Widget _buildAssignedOrderStream() {
     return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
       stream: _firestore
@@ -766,23 +803,21 @@ class _HomeScreenState extends State<HomeScreen> {
           .snapshots(),
       builder: (context, snapshot) {
         if (snapshot.hasError) {
-          _stopArrivalMonitor(); // Stop if there's an error
+          _stopArrivalMonitor();
           return const Center(child: Text("Something went wrong."));
         }
-
-        // If there is no active order, ensure the monitor is stopped.
         if (!snapshot.hasData || snapshot.data!.docs.isEmpty) {
           _stopArrivalMonitor();
           return const Center(
-              child: Padding(
-                  padding: EdgeInsets.all(16.0),
-                  child: Text("No active assigned orders.")));
+            child: Padding(
+              padding: EdgeInsets.all(16.0),
+              child: Text("No active assigned orders."),
+            ),
+          );
         }
 
         final orderDoc = snapshot.data!.docs.first;
         final orderData = orderDoc.data();
-
-        // This is the crucial call that triggers the monitoring logic
         _startArrivalMonitor(orderData, orderDoc.id);
 
         return Padding(
@@ -795,20 +830,17 @@ class _HomeScreenState extends State<HomeScreen> {
               _showConfirmationDialog(
                 context: context,
                 title: 'Confirm Status Change',
-                content: 'Mark this order as ${newStatus == 'pickedUp'
-                    ? 'Picked Up'
-                    : 'Delivered'}?',
+                content: 'Mark this order as ${newStatus == 'pickedUp' ? 'Picked Up' : 'Delivered'}?',
                 onConfirm: () => _updateOrderStatus(orderDoc.id, newStatus),
               );
             },
-            onCardTap: () =>
-                _showOrderDetailsSheet(context, orderData, orderDoc.id),
-            actionButtonText: orderData['status'] == 'accepted' ||
-                orderData['status'] == 'rider_assigned'
-                ? 'Mark Picked Up' : 'Mark Delivered',
-            nextStatus: orderData['status'] == 'accepted' ||
-                orderData['status'] == 'rider_assigned'
-                ? 'pickedUp' : 'delivered',
+            onCardTap: () => _showOrderDetailsSheet(context, orderData, orderDoc.id),
+            actionButtonText: orderData['status'] == 'accepted' || orderData['status'] == 'rider_assigned'
+                ? 'Mark Picked Up'
+                : 'Mark Delivered',
+            nextStatus: orderData['status'] == 'accepted' || orderData['status'] == 'rider_assigned'
+                ? 'pickedUp'
+                : 'delivered',
             isAcceptAction: false,
           ),
         );
@@ -816,25 +848,53 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  Widget _buildAvailableOrdersStream() {
+  Widget _buildAvailableOrdersStream(List<String> riderBranches) {
+    // If the driver has no branches configured, show a friendly message.
+    if (riderBranches.isEmpty) {
+      return const Center(
+        child: Padding(
+          padding: EdgeInsets.all(16),
+          child: Text("No branch configured on your profile. Please contact support."),
+        ),
+      );
+    }
+
+    // Server-side filter for any matching branch (up to 10 values per Firestore constraint).
+    final List<String> branchFilter = riderBranches.take(10).toList();
+
+    Query<Map<String, dynamic>> q = _firestore
+        .collection('Orders')
+        .where('status', isEqualTo: 'prepared')
+        .where('riderId', isEqualTo: "");
+
+    // Apply branchIds filter
+    q = q.where('branchIds', arrayContainsAny: branchFilter);
+
     return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
-      stream: _firestore
-          .collection('Orders')
-          .where('status', isEqualTo: 'prepared')
-          .where('riderId', isEqualTo: "")
-          .snapshots(),
+      stream: q.snapshots(),
       builder: (context, snapshot) {
         if (snapshot.hasError) {
           return const Center(child: Text("Something went wrong."));
         }
-        if (!snapshot.hasData || snapshot.data!.docs.isEmpty) {
+        if (!snapshot.hasData) {
+          return const Center(child: CircularProgressIndicator());
+        }
+
+        // Client-side safety filter (also handles if more than 10 branches exist).
+        final filtered = snapshot.data!.docs.where((doc) {
+          final orderBranches = doc.data()['branchIds'] as List<dynamic>?;
+          return _orderMatchesBranches(orderBranches, riderBranches);
+        }).toList();
+
+        if (filtered.isEmpty) {
           return const Center(child: Text("No new orders available."));
         }
+
         return ListView.builder(
           padding: const EdgeInsets.symmetric(horizontal: 16),
-          itemCount: snapshot.data!.docs.length,
+          itemCount: filtered.length,
           itemBuilder: (context, index) {
-            final orderDoc = snapshot.data!.docs[index];
+            final orderDoc = filtered[index];
             final orderData = orderDoc.data();
             return Padding(
               padding: const EdgeInsets.only(bottom: 12.0),
@@ -844,13 +904,13 @@ class _HomeScreenState extends State<HomeScreen> {
                 statusColor: _getStatusColor(orderData['status']),
                 onAccept: () {
                   _showConfirmationDialog(
-                    context: context, title: 'Accept Order?',
+                    context: context,
+                    title: 'Accept Order?',
                     content: 'Are you sure you want to accept this delivery?',
                     onConfirm: () => _acceptOrder(orderDoc.id),
                   );
                 },
-                onCardTap: () =>
-                    _showOrderDetailsSheet(context, orderData, orderDoc.id),
+                onCardTap: () => _showOrderDetailsSheet(context, orderData, orderDoc.id),
                 actionButtonText: 'Accept Order',
                 nextStatus: 'accepted',
                 isAcceptAction: true,
@@ -862,29 +922,37 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  /* -------------------------------------------------------------------------
-   * Order actions
-   * ---------------------------------------------------------------------- */
+  // ------------- Order actions -------------
   Future<void> _acceptOrder(String orderDocId) async {
-    if (_riderEmail == null) return;
-
+    if (_riderEmail == null || _riderDocRef == null) return;
     try {
       await _firestore.runTransaction((tx) async {
-        final ref = _firestore.collection('Orders').doc(orderDocId);
-        final snap = await tx.get(ref);
-
-        if (!snap.exists) {
+        final orderRef = _firestore.collection('Orders').doc(orderDocId);
+        final orderSnap = await tx.get(orderRef);
+        if (!orderSnap.exists) {
           throw Exception("Order not found.");
         }
 
-        final data = snap.data() as Map<String, dynamic>? ?? {};
-        final String riderId = (data['riderId'] as String?) ?? "";
-        final String status = (data['status'] as String?) ?? "";
-        final bool assignmentPending = (data['assignmentPending'] as bool?) == true;
+        final orderData = orderSnap.data() as Map<String, dynamic>? ?? {};
+        final String riderId = (orderData['riderId'] as String?) ?? "";
+        final String status = (orderData['status'] as String?) ?? "";
+        final bool assignmentPending = (orderData['assignmentPending'] as bool?) == true;
 
-        // Only allow self-accept when it's still available and not under active auto-assign.
+        // Load driver's branches inside the transaction for consistency
+        final riderSnap = await tx.get(_riderDocRef!);
+        final List<String> riderBranches = (riderSnap.data()?['branchIds'] as List?)
+            ?.map((e) => e.toString())
+            .toList() ??
+            [];
+        final List<dynamic>? orderBranches = orderData['branchIds'] as List<dynamic>?;
+
+        // Enforce branch match
+        if (!_orderMatchesBranches(orderBranches, riderBranches)) {
+          throw Exception("This order belongs to another branch.");
+        }
+
         if (riderId.isEmpty && status == 'prepared' && !assignmentPending) {
-          tx.update(ref, {
+          tx.update(orderRef, {
             'riderId': _riderEmail,
             'status': 'rider_assigned',
             'timestamps.accepted': FieldValue.serverTimestamp(),
@@ -894,10 +962,8 @@ class _HomeScreenState extends State<HomeScreen> {
         }
       });
 
-      // Mark as self-accepted to suppress duplicate assignment notifications.
       _selfAccepted.add(orderDocId);
 
-      // Sync driver document: mark busy and store assigned order id.
       if (_riderDocRef != null) {
         await _riderDocRef!.set(
           {
@@ -923,7 +989,6 @@ class _HomeScreenState extends State<HomeScreen> {
         'timestamps.$newStatus': FieldValue.serverTimestamp(),
       });
 
-      // Stop arrival monitor when delivered and reset driver availability + assignment.
       if (newStatus == 'delivered') {
         await _stopArrivalMonitor();
         if (_riderDocRef != null) {
