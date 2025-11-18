@@ -1,65 +1,41 @@
-import 'package:flutter/material.dart';
 import 'package:firebase_auth/firebase_auth.dart';
-import 'package:cloud_firestore/cloud_firestore.dart';
-import 'package:myapp/screens/login_screen.dart';
-import 'package:myapp/main.dart'; // MainNavigation
+import 'package:flutter/material.dart';
+import '../../screens/home_screen.dart';
+import '../../screens/login_screen.dart';
 
 class AuthGate extends StatelessWidget {
   const AuthGate({super.key});
 
-  Future<bool> _isRider(String email) async {
-    final snap =
-        await FirebaseFirestore.instance
-            .collection('Drivers')
-            .where('email', isEqualTo: email)
-            .limit(1)
-            .get();
-
-    return snap.docs.isNotEmpty;
-  }
-
   @override
   Widget build(BuildContext context) {
+    print("🚪 AuthGate building...");
     return StreamBuilder<User?>(
       stream: FirebaseAuth.instance.authStateChanges(),
-      builder: (context, authSnap) {
-        if (authSnap.connectionState == ConnectionState.waiting) {
+      builder: (context, snapshot) {
+        print("🔄 Auth State: ${snapshot.connectionState}, Has Data: ${snapshot.hasData}");
+
+        if (snapshot.connectionState == ConnectionState.waiting) {
           return const Scaffold(
-            body: Center(child: CircularProgressIndicator()),
+            body: Center(
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  CircularProgressIndicator(),
+                  SizedBox(height: 20),
+                  Text("Loading Auth State..."), // Visual debug text
+                ],
+              ),
+            ),
           );
         }
 
-        final user = authSnap.data;
-
-        if (user == null) {
-          return const LoginScreen();
+        if (snapshot.hasData) {
+          print("✅ User logged in: ${snapshot.data?.email}");
+          return const HomeScreen();
         }
 
-        return FutureBuilder<bool>(
-          future: _isRider(user.email ?? ""),
-          builder: (context, riderSnap) {
-            if (riderSnap.connectionState == ConnectionState.waiting) {
-              return const Scaffold(
-                body: Center(child: CircularProgressIndicator()),
-              );
-            }
-
-            if (riderSnap.hasData && riderSnap.data == true) {
-              return const MainNavigation(); // ✅ verified Rider
-            } else {
-              WidgetsBinding.instance.addPostFrameCallback((_) {
-                ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(
-                    content: Text("No Driver account found."),
-                    backgroundColor: Colors.red,
-                  ),
-                );
-              });
-              FirebaseAuth.instance.signOut(); // ❌ force logout
-              return const LoginScreen();
-            }
-          },
-        );
+        print("👤 User logged out, showing LoginScreen");
+        return const LoginScreen();
       },
     );
   }

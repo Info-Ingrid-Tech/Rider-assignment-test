@@ -1,370 +1,227 @@
-// lib/AssignmentOffer.dart
-
 import 'dart:async';
-
-import 'package:flutter/material.dart';
-
 import 'package:cloud_firestore/cloud_firestore.dart';
-import 'package:firebase_auth/firebase_auth.dart';
+import 'package:flutter/material.dart';
+// import 'package:just_audio/just_audio.dart'; // Optional: Add sound here if you want
 
-import 'package:geolocator/geolocator.dart';
-
-class AssignmentOfferBanner extends StatefulWidget {
-  // NEW: assignment document id in rider_assignments
-  final String assignmentDocId;
-
-  // Existing: order document id in Orders
+class AssignmentOffer extends StatefulWidget {
+  final String assignmentId;
   final String orderId;
+  final VoidCallback onDismiss;
 
-  // Callbacks
-  final VoidCallback onResolvedExternally;
-  final Future Function() onAccept;
-  final Future Function() onReject;
-  final Future Function() onTimeout;
-
-  // Countdown seeds
-  final int? initialSeconds;
-  final DateTime? expiresAt;
-
-  // Styling
-  final Color? cardColor;
-
-  const AssignmentOfferBanner({
+  const AssignmentOffer({
     super.key,
-    required this.assignmentDocId,
+    required this.assignmentId,
     required this.orderId,
-    required this.onAccept,
-    required this.onReject,
-    required this.onTimeout,
-    required this.onResolvedExternally,
-    this.initialSeconds,
-    this.expiresAt,
-    this.cardColor,
+    required this.onDismiss,
   });
 
   @override
-  State<AssignmentOfferBanner> createState() => _AssignmentOfferBannerState();
+  State<AssignmentOffer> createState() => _AssignmentOfferState();
 }
 
-class _AssignmentOfferBannerState extends State<AssignmentOfferBanner> {
-  final _db = FirebaseFirestore.instance;
-  final _auth = FirebaseAuth.instance;
-
-  Map<String, dynamic>? _order;
-
-  // Countdown state
-  int _secondsLeft = 0;
-  DateTime? _expiresAt;
+class _AssignmentOfferState extends State<AssignmentOffer> {
+  int _secondsRemaining = 120; // Matches your server timeout
   Timer? _timer;
-
-  // Assignment watcher
-  StreamSubscription<DocumentSnapshot<Map<String, dynamic>>>? _assignSub;
-
-  bool _busy = false;
+  bool _isLoading = false;
 
   @override
   void initState() {
     super.initState();
+    _startTimer();
+    // _playSound(); // Optional sound play
+  }
 
-    _expiresAt = widget.expiresAt;
-
-    if (_expiresAt != null) {
-      _secondsLeft = _remainingSeconds();
-    } else {
-      final seed = (widget.initialSeconds ?? 120);
-      _secondsLeft = seed > 0 ? seed.clamp(1, 600) : 120;
-    }
-
-    _load();
-    _startCountdown();
-    _watchResolution();
+  void _startTimer() {
+    _timer = Timer.periodic(const Duration(seconds: 1), (timer) {
+      if (_secondsRemaining > 0) {
+        setState(() {
+          _secondsRemaining--;
+        });
+      } else {
+        timer.cancel();
+        widget.onDismiss(); // Auto dismiss on timeout
+      }
+    });
   }
 
   @override
   void dispose() {
     _timer?.cancel();
-    _assignSub?.cancel();
     super.dispose();
   }
 
-  Future<void> _load() async {
+  Future<void> _respondToOffer(String status) async {
+    setState(() => _isLoading = true);
     try {
-      final snap = await _db.collection('Orders').doc(widget.orderId).get();
-      if (!mounted) return;
-      _order = snap.data();
-      if (mounted) setState(() {});
+      // Update the assignment status.
+      // The Cloud Function "handleRiderAcceptance" (Step 6) will listen to this.
+      await FirebaseFirestore.instance
+          .collection('rider_assignments')
+          .doc(widget.assignmentId) // Use assignmentId (which is usually the orderId)
+          .update({'status': status});
+
+      widget.onDismiss(); // Close the dialog
     } catch (e) {
-      // Ignore UI errors here
-    }
-  }
-
-  int _remainingSeconds() {
-    if (_expiresAt == null) return _secondsLeft;
-    final now = DateTime.now();
-    final secs = _expiresAt!.difference(now).inSeconds;
-    return secs.clamp(0, 600);
-  }
-
-  void _startCountdown() {
-    _timer = Timer.periodic(const Duration(seconds: 1), (t) async {
-      if (!mounted) {
-        t.cancel();
-        return;
-      }
-
-      final next = _expiresAt != null ? _remainingSeconds() : (_secondsLeft - 1);
-
-      if (next <= 0) {
-        t.cancel();
-        await _safeRun(widget.onTimeout);
-      } else {
-        setState(() => _secondsLeft = next);
-      }
-    });
-  }
-
-  void _watchResolution() {
-    // IMPORTANT: watch by assignmentDocId (not orderId) because rider_assignments doc ids are random
-    _assignSub = _db
-        .collection('rider_assignments')
-        .doc(widget.assignmentDocId)
-        .snapshots()
-        .listen((snap) {
-      if (!snap.exists || !mounted) return;
-      final status = snap.data()?['status'] as String?;
-      // Close the banner when offer is resolved elsewhere
-      if (status == 'accepted' || status == 'rejected' || status == 'timeout') {
-        widget.onResolvedExternally();
-      }
-
-      // Optional: if backend extends the offer, update expiresAt live
-      final expiresTs = snap.data()?['expiresAt'];
-      if (expiresTs is Timestamp) {
-        final newExpiry = expiresTs.toDate();
-        if (_expiresAt == null || newExpiry.isAfter(_expiresAt!)) {
-          setState(() {
-            _expiresAt = newExpiry;
-            _secondsLeft = _remainingSeconds();
-          });
-        }
-      }
-    });
-  }
-
-  Future<void> _safeRun(Future Function() fn) async {
-    if (_busy || !mounted) return;
-    setState(() => _busy = true);
-    try {
-      await fn();
-    } finally {
-      if (mounted) setState(() => _busy = false);
-    }
-  }
-
-  Future<double?> _distanceMeters() async {
-    final o = _order;
-    if (o == null) return null;
-    final drop = o['deliveryAddress']?['geolocation'];
-    if (drop == null) return null;
-    try {
-      final pos = await Geolocator.getCurrentPosition();
-      return Geolocator.distanceBetween(
-        pos.latitude,
-        pos.longitude,
-        drop.latitude,
-        drop.longitude,
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Error: $e')),
       );
-    } catch (_) {
-      return null;
+      setState(() => _isLoading = false);
     }
   }
 
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final o = _order;
-
-    return Material(
-      color: Colors.transparent,
-      child: Container(
-        decoration: BoxDecoration(
-          color: widget.cardColor ?? theme.cardColor,
-          borderRadius: BorderRadius.circular(16),
-          boxShadow: [
-            BoxShadow(
-              color: Colors.black.withOpacity(0.15),
-              blurRadius: 16,
-              offset: const Offset(0, 8),
-            ),
-          ],
-          gradient: LinearGradient(
-            begin: Alignment.topLeft,
-            end: Alignment.bottomRight,
-            colors: [
-              (widget.cardColor ?? theme.cardColor).withOpacity(0.98),
-              (widget.cardColor ?? theme.cardColor).withOpacity(0.92),
+    return Scaffold(
+      backgroundColor: Colors.black.withOpacity(0.6),
+      body: Center(
+        child: Container(
+          margin: const EdgeInsets.all(20),
+          padding: const EdgeInsets.all(24),
+          decoration: BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.circular(24),
+            boxShadow: [
+              BoxShadow(color: Colors.black26, blurRadius: 20, spreadRadius: 5)
             ],
           ),
-          border: Border.all(color: Colors.black.withOpacity(0.06)),
-        ),
-        padding: const EdgeInsets.all(14),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            // Header
-            Row(
-              children: [
-                const Icon(Icons.delivery_dining, size: 22),
-                const SizedBox(width: 8),
-                Text(
-                  'Delivery Offer',
-                  style: theme.textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700),
-                ),
-                const Spacer(),
-                _CountdownPill(seconds: _secondsLeft),
-              ],
-            ),
-            const SizedBox(height: 10),
+          child: FutureBuilder<DocumentSnapshot>(
+              future: FirebaseFirestore.instance.collection('Orders').doc(widget.orderId).get(),
+              builder: (context, snapshot) {
+                if (!snapshot.hasData) {
+                  return const SizedBox(
+                      height: 200,
+                      child: Center(child: CircularProgressIndicator())
+                  );
+                }
 
-            // Body
-            if (o == null)
-              Row(
-                children: [
-                  const SizedBox(
-                    height: 18,
-                    width: 18,
-                    child: CircularProgressIndicator(strokeWidth: 2),
-                  ),
-                  const SizedBox(width: 10),
-                  Text('Loading order details...', style: theme.textTheme.bodyMedium),
-                ],
-              )
-            else
-              Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    'Order #${o['dailyOrderNumber'] ?? widget.orderId}',
-                    style: theme.textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w600),
-                  ),
-                  const SizedBox(height: 6),
-                  Row(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      const Icon(Icons.location_pin, size: 18),
-                      const SizedBox(width: 6),
-                      Expanded(
-                        child: Text(
-                          o['deliveryAddress']?['fullAddress'] ?? 'Delivery address in details',
-                          style: theme.textTheme.bodyMedium,
-                        ),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 6),
-                  Builder(builder: (context) {
-                    final addr = (o['deliveryAddress'] as Map?) ?? const {};
-                    final street = (addr['street'] as String?)?.trim() ?? '';
-                    final streetToShow = street.isNotEmpty ? street : 'Street not specified';
-                    return Row(
-                      crossAxisAlignment: CrossAxisAlignment.start,
+                final orderData = snapshot.data!.data() as Map<String, dynamic>;
+                final double totalAmount = (orderData['totalAmount'] as num?)?.toDouble() ?? 0.0;
+                final String address = orderData['deliveryAddress']?['street'] ?? 'Unknown Address';
+                final String distance = "3.5 km"; // You can calculate this if you have lat/lng
+
+                return Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    // Header with Countdown
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
                       children: [
-                        const Icon(Icons.home, size: 18),
-                        const SizedBox(width: 6),
-                        Expanded(
+                        const Text(
+                          "New Order Request",
+                          style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                        ),
+                        Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                          decoration: BoxDecoration(
+                            color: _secondsRemaining < 30 ? Colors.red.shade100 : Colors.orange.shade100,
+                            borderRadius: BorderRadius.circular(20),
+                          ),
                           child: Text(
-                            streetToShow,
-                            style: theme.textTheme.bodyMedium?.copyWith(fontWeight: FontWeight.w600),
+                            "00:${_secondsRemaining.toString().padLeft(2, '0')}",
+                            style: TextStyle(
+                              color: _secondsRemaining < 30 ? Colors.red : Colors.deepOrange,
+                              fontWeight: FontWeight.bold,
+                            ),
                           ),
                         ),
                       ],
-                    );
-                  }),
-                  const SizedBox(height: 6),
-                  FutureBuilder<double?>(
-                    future: _distanceMeters(),
-                    builder: (context, snap) {
-                      final txt = !snap.hasData
-                          ? 'Calculating distance...'
-                          : 'Approx. ${(snap.data! / 1000).toStringAsFixed(1)} km';
-                      return Row(
+                    ),
+                    const Divider(height: 30),
+
+                    // Price & Distance
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceAround,
+                      children: [
+                        Column(
+                          children: [
+                            const Icon(Icons.account_balance_wallet, color: Colors.green, size: 28),
+                            const SizedBox(height: 4),
+                            Text(
+                              "QAR ${totalAmount.toStringAsFixed(2)}",
+                              style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                            ),
+                            const Text("Earnings", style: TextStyle(color: Colors.grey, fontSize: 12)),
+                          ],
+                        ),
+                        Container(height: 40, width: 1, color: Colors.grey.shade300),
+                        Column(
+                          children: [
+                            const Icon(Icons.location_on, color: Colors.blue, size: 28),
+                            const SizedBox(height: 4),
+                            Text(
+                              distance,
+                              style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                            ),
+                            const Text("Distance", style: TextStyle(color: Colors.grey, fontSize: 12)),
+                          ],
+                        ),
+                      ],
+                    ),
+
+                    const SizedBox(height: 24),
+
+                    // Address
+                    Container(
+                      padding: const EdgeInsets.all(16),
+                      decoration: BoxDecoration(
+                        color: Colors.grey.shade50,
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                      child: Row(
                         children: [
-                          const Icon(Icons.route, size: 18),
-                          const SizedBox(width: 6),
-                          Text(txt, style: theme.textTheme.bodyMedium),
+                          const Icon(Icons.home_work_outlined, color: Colors.grey),
+                          const SizedBox(width: 12),
+                          Expanded(
+                            child: Text(
+                              address,
+                              style: const TextStyle(fontSize: 14, height: 1.4),
+                              maxLines: 2,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ),
                         ],
-                      );
-                    },
-                  ),
-                ],
-              ),
-
-            const SizedBox(height: 12),
-
-            // Actions
-            Row(
-              children: [
-                Expanded(
-                  child: OutlinedButton.icon(
-                    onPressed: _busy ? null : () => _safeRun(widget.onReject),
-                    icon: const Icon(Icons.close),
-                    label: const Text('Reject'),
-                    style: OutlinedButton.styleFrom(
-                      foregroundColor: Colors.red,
-                      side: const BorderSide(color: Colors.red),
-                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                      ),
                     ),
-                  ),
-                ),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: ElevatedButton.icon(
-                    onPressed: _busy ? null : () => _safeRun(widget.onAccept),
-                    icon: const Icon(Icons.check),
-                    label: const Text('Accept'),
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: Colors.green,
-                      foregroundColor: Colors.white,
-                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-                      elevation: 0,
-                    ),
-                  ),
-                ),
-              ],
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
 
-class _CountdownPill extends StatelessWidget {
-  final int seconds;
-  const _CountdownPill({required this.seconds});
+                    const SizedBox(height: 32),
 
-  @override
-  Widget build(BuildContext context) {
-    final color = seconds <= 10
-        ? Colors.red
-        : (seconds <= 20 ? Colors.orange : Colors.blue);
-
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-      decoration: BoxDecoration(
-        color: color.withOpacity(0.12),
-        borderRadius: BorderRadius.circular(999),
-      ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Icon(Icons.timer, size: 16, color: color),
-          const SizedBox(width: 6),
-          Text(
-            '$seconds s',
-            style: TextStyle(fontWeight: FontWeight.w700, color: color),
+                    // Action Buttons
+                    if (_isLoading)
+                      const Center(child: CircularProgressIndicator())
+                    else
+                      Row(
+                        children: [
+                          Expanded(
+                            child: OutlinedButton(
+                              onPressed: () => _respondToOffer('rejected'),
+                              style: OutlinedButton.styleFrom(
+                                padding: const EdgeInsets.symmetric(vertical: 16),
+                                side: const BorderSide(color: Colors.red),
+                                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                              ),
+                              child: const Text("Reject", style: TextStyle(color: Colors.red, fontSize: 16)),
+                            ),
+                          ),
+                          const SizedBox(width: 16),
+                          Expanded(
+                            child: ElevatedButton(
+                              onPressed: () => _respondToOffer('accepted'),
+                              style: ElevatedButton.styleFrom(
+                                padding: const EdgeInsets.symmetric(vertical: 16),
+                                backgroundColor: Colors.green,
+                                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                                elevation: 0,
+                              ),
+                              child: const Text("Accept", style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
+                            ),
+                          ),
+                        ],
+                      ),
+                  ],
+                );
+              }
           ),
-        ],
+        ),
       ),
     );
   }
