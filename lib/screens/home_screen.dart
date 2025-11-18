@@ -596,10 +596,28 @@ class _HomeScreenState extends State<HomeScreen> {
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
+      useSafeArea: true,
       backgroundColor: Colors.transparent,
-      builder: (context) => OrderDetailsSheet(orderData: orderData, orderId: orderId),
+      barrierColor: Colors.black.withOpacity(0.5),
+      isDismissible: true,
+      enableDrag: true,
+      builder: (context) {
+        return DraggableScrollableSheet(
+          initialChildSize: 0.5,
+          minChildSize: 0.5,
+          maxChildSize: 0.9,
+          builder: (context, scrollController) {
+            return OrderDetailsSheet(
+              orderData: orderData,
+              orderId: orderId,
+              scrollController: scrollController,
+            );
+          },
+        );
+      },
     );
   }
+
 
   Future<void> _updateRiderStatus(bool isOnline) async {
     if (_riderDocRef != null) {
@@ -648,7 +666,7 @@ class _HomeScreenState extends State<HomeScreen> {
             ),
             ElevatedButton(
               style: ElevatedButton.styleFrom(
-                backgroundColor: AppTheme.dangerColor,
+                backgroundColor: AppTheme.primaryColor,
                 foregroundColor: Colors.white,
                 shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
               ),
